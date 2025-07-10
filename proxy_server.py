@@ -33,8 +33,7 @@ def jira_search_endpoint():
     # --- Robust JQL Construction ---
     # 1. Sanitize for JQL special characters (quotes).
     sanitized_search = user_query.replace('"', '\\"')
-    # 2. Remove any user-added wildcards or trailing spaces to prevent syntax errors.
-    #    The backend will add its own controlled wildcard.
+    # 2. Remove any user-added wildcards or trailing spaces.
     cleaned_search = sanitized_search.rstrip('*? ')
 
     # If after cleaning, the search is empty, return no results.
@@ -46,9 +45,10 @@ def jira_search_endpoint():
         clauses.append(f'project = "{project_key.upper()}"')
     
     # 3. Build a comprehensive search clause.
-    #    - `issuekey ~ ...`: Searches for the ticket ID itself (e.g., "SCRUM-123").
+    #    THE FIX: Use the '=' operator for `issuekey`, as `~` is not supported for that field.
+    #    - `issuekey = ...`: Searches for the exact ticket ID.
     #    - `text ~ "...*"`: Performs a wildcard text search on summary, description, etc.
-    search_clause = f'(issuekey ~ "{cleaned_search.upper()}" OR text ~ "{cleaned_search}*")'
+    search_clause = f'(issuekey = "{cleaned_search.upper()}" OR text ~ "{cleaned_search}*")'
     clauses.append(search_clause)
     
     jql_query = " AND ".join(clauses) + " ORDER BY updated DESC"
