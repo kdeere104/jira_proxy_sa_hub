@@ -19,7 +19,7 @@ JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN")
 def jira_search_endpoint():
     """
     An API endpoint that the frontend will call.
-    It expects a query parameter like: /search-jira?q=some-term
+    It intelligently constructs a JQL query based on the user's input.
     """
     user_query = request.args.get("q")
     project_key = request.args.get("project")
@@ -32,33 +32,40 @@ def jira_search_endpoint():
 
     # --- Robust JQL Construction ---
     sanitized_search = user_query.replace('"', '\\"')
-    cleaned_search = sanitized_search.rstrip('*? ')
+    cleaned_search = sanitized_search.strip()
 
     if not cleaned_search:
         return jsonify([])
 
-    # Define clauses for the main JQL query
+    # This set will hold all the individual OR conditions for our JQL query.
+    # Using a set automatically handles duplicates.
+    search_components = set()
+
+    # 1. Always add a general text search. This is the fallback for all queries.
+    #    The `~` operator means "CONTAINS". The `*` makes it a "STARTS WITH" search.
+    search_components.add(f'text ~ "{cleaned_search}*"')
+
+    # 2. Check if the search term is a complete issue key (e.g., "PROJ-123").
+    #    If so, add a precise `issuekey =` search, which is very fast.
+    issue_key_pattern = re.compile(r'^[a-z0-9_]+-\d+$', re.IGNORECASE)
+    if issue_key_pattern.fullmatch(cleaned_search):
+        search_components.add(f'issuekey = "{cleaned_search.upper()}"')
+
+    # 3. Smart Search: If a project key is set and the user types only numbers,
+    #    construct a full issue key. This allows searching for "17" to find "SCRUM-17".
+    if project_key and cleaned_search.isdigit():
+        potential_key = f'"{project_key.upper()}-{cleaned_search}"'
+        search_components.add(f'issuekey = {potential_key}')
+    
+    # --- Assemble Final JQL Query ---
     clauses = []
     if project_key:
         clauses.append(f'project = "{project_key.upper()}"')
     
-    # --- THE FIX ---
-    # Regex to check if the search term looks like a complete JIRA issue key (e.g., PROJ-123).
-    # This prevents sending syntactically invalid JQL like `issuekey = "SCR"`.
-    issue_key_complete_pattern = re.compile(r'^[a-z0-9_]+-\d+$', re.IGNORECASE)
-
-    # Always search in the general text fields.
-    search_clause_components = [f'text ~ "{cleaned_search}*"']
-    
-    # ONLY if the search term looks like a complete key, add an OR condition
-    # to search the 'issuekey' field directly. This is more precise and avoids errors.
-    if issue_key_complete_pattern.fullmatch(cleaned_search):
-        search_clause_components.append(f'issuekey = "{cleaned_search.upper()}"')
-    
-    # Combine the search conditions with OR.
-    # This will be either `(text ~ "...")` or `((text ~ "...") OR issuekey = "...")`
-    search_clause = f'({" OR ".join(search_clause_components)})'
-    clauses.append(search_clause)
+    # Combine all our search conditions with "OR".
+    if search_components:
+        search_clause = f'({" OR ".join(search_components)})'
+        clauses.append(search_clause)
     
     jql_query = " AND ".join(clauses) + " ORDER BY updated DESC"
 
