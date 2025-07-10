@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -27,28 +28,36 @@ def jira_search_endpoint():
         return jsonify({"error": "Backend server is missing JIRA configuration."}), 500
 
     if not user_query:
-        # Gracefully handle empty searches without sending a bad request to Jira.
         return jsonify([])
 
     # --- Robust JQL Construction ---
-    # 1. Sanitize for JQL special characters (quotes).
     sanitized_search = user_query.replace('"', '\\"')
-    # 2. Remove any user-added wildcards or trailing spaces.
     cleaned_search = sanitized_search.rstrip('*? ')
 
-    # If after cleaning, the search is empty, return no results.
     if not cleaned_search:
         return jsonify([])
 
+    # Define clauses for the main JQL query
     clauses = []
     if project_key:
         clauses.append(f'project = "{project_key.upper()}"')
     
-    # 3. Build a comprehensive search clause.
-    #    THE FIX: Use the '=' operator for `issuekey`, as `~` is not supported for that field.
-    #    - `issuekey = ...`: Searches for the exact ticket ID.
-    #    - `text ~ "...*"`: Performs a wildcard text search on summary, description, etc.
-    search_clause = f'(issuekey = "{cleaned_search.upper()}" OR text ~ "{cleaned_search}*")'
+    # --- THE FIX ---
+    # Regex to check if the search term looks like a complete JIRA issue key (e.g., PROJ-123).
+    # This prevents sending syntactically invalid JQL like `issuekey = "SCR"`.
+    issue_key_complete_pattern = re.compile(r'^[a-z0-9_]+-\d+$', re.IGNORECASE)
+
+    # Always search in the general text fields.
+    search_clause_components = [f'text ~ "{cleaned_search}*"']
+    
+    # ONLY if the search term looks like a complete key, add an OR condition
+    # to search the 'issuekey' field directly. This is more precise and avoids errors.
+    if issue_key_complete_pattern.fullmatch(cleaned_search):
+        search_clause_components.append(f'issuekey = "{cleaned_search.upper()}"')
+    
+    # Combine the search conditions with OR.
+    # This will be either `(text ~ "...")` or `((text ~ "...") OR issuekey = "...")`
+    search_clause = f'({" OR ".join(search_clause_components)})'
     clauses.append(search_clause)
     
     jql_query = " AND ".join(clauses) + " ORDER BY updated DESC"
@@ -61,8 +70,6 @@ def jira_search_endpoint():
 
     try:
         response = requests.post(search_url, headers=headers, auth=auth, json=query_data, timeout=10)
-        
-        # This will automatically raise an exception for 4xx/5xx responses.
         response.raise_for_status() 
         
         results = response.json()
@@ -71,20 +78,17 @@ def jira_search_endpoint():
         return jsonify(simplified_issues)
 
     except requests.exceptions.HTTPError as e:
-        # Provide a much more informative error message to the frontend.
         error_details = f"Jira returned HTTP {e.response.status_code}: {e.response.reason}"
         try:
-            # Attempt to parse Jira's specific error message from the response body.
             jira_error = e.response.json()
             if 'errorMessages' in jira_error and jira_error['errorMessages']:
                  error_details = f"Jira Error: {', '.join(jira_error['errorMessages'])}"
             elif 'errors' in jira_error and jira_error['errors']:
                  error_details = f"Jira Field Error: {json.dumps(jira_error['errors'])}"
         except json.JSONDecodeError:
-            # No JSON body, use the default HTTP error.
             pass
         
-        print(f"JIRA API Error: {error_details}") # Log the detailed error on the server
+        print(f"JIRA API Error: {error_details}")
         return jsonify({"error": error_details}), e.response.status_code
 
     except requests.exceptions.RequestException as e:
@@ -94,6 +98,5 @@ def jira_search_endpoint():
         print(f"Unexpected Error: {str(e)}")
         return jsonify({"error": f"An unexpected server error occurred: {str(e)}"}), 500
 
-# This allows the app to be run by a production server like Gunicorn
 if __name__ == "__main__":
     app.run(port=int(os.environ.get("PORT", 8080)))
