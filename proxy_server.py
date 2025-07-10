@@ -1,6 +1,4 @@
 import os
-import json
-import re
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -19,80 +17,64 @@ JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN")
 def jira_search_endpoint():
     """
     An API endpoint that the frontend will call.
-    It intelligently constructs a JQL query based on the user's input.
+    This uses the JIRA Issue Picker API, which is designed for fast,
+    interactive searches and supports partial matching on issue keys.
     """
     user_query = request.args.get("q")
     project_key = request.args.get("project")
 
+    # --- Validation ---
     if not all([JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN]):
         return jsonify({"error": "Backend server is missing JIRA configuration."}), 500
 
-    if not user_query:
+    if not user_query or not user_query.strip():
         return jsonify([])
 
-    # --- Robust JQL Construction ---
-    sanitized_search = user_query.replace('"', '\\"')
-    cleaned_search = sanitized_search.strip()
-
-    if not cleaned_search:
-        return jsonify([])
-
-    # This set will hold all the individual OR conditions for our JQL query.
-    # Using a set automatically handles duplicates.
-    search_components = set()
-
-    # 1. Always add a general text search. This is the fallback for all queries.
-    #    The `~` operator means "CONTAINS". The `*` makes it a "STARTS WITH" search.
-    search_components.add(f'text ~ "{cleaned_search}*"')
-
-    # 2. Check if the search term is a complete issue key (e.g., "PROJ-123").
-    #    If so, add a precise `issuekey =` search, which is very fast.
-    issue_key_pattern = re.compile(r'^[a-z0-9_]+-\d+$', re.IGNORECASE)
-    if issue_key_pattern.fullmatch(cleaned_search):
-        search_components.add(f'issuekey = "{cleaned_search.upper()}"')
-
-    # 3. Smart Search: If a project key is set and the user types only numbers,
-    #    construct a full issue key. This allows searching for "17" to find "SCRUM-17".
-    if project_key and cleaned_search.isdigit():
-        potential_key = f'"{project_key.upper()}-{cleaned_search}"'
-        search_components.add(f'issuekey = {potential_key}')
-    
-    # --- Assemble Final JQL Query ---
-    clauses = []
-    if project_key:
-        clauses.append(f'project = "{project_key.upper()}"')
-    
-    # Combine all our search conditions with "OR".
-    if search_components:
-        search_clause = f'({" OR ".join(search_components)})'
-        clauses.append(search_clause)
-    
-    jql_query = " AND ".join(clauses) + " ORDER BY updated DESC"
-
-    # --- Call Jira API ---
-    search_url = f"{JIRA_URL}/rest/api/3/search"
+    # --- Call Jira Issue Picker API ---
+    # This endpoint is specifically designed for UI pickers and supports partial matching.
+    picker_url = f"{JIRA_URL}/rest/api/3/issue/picker"
     auth = HTTPBasicAuth(JIRA_EMAIL, JIRA_API_TOKEN)
     headers = {"Accept": "application/json"}
-    query_data = {'jql': jql_query, 'fields': ["summary", "key"], 'maxResults': 25}
+    
+    params = {'query': user_query.strip()}
+    
+    # If a project key is provided, scope the search to that project.
+    if project_key and project_key.strip():
+        # Using currentJQL to filter by project
+        params['currentJQL'] = f'project = "{project_key.strip().upper()}"'
 
     try:
-        response = requests.post(search_url, headers=headers, auth=auth, json=query_data, timeout=10)
-        response.raise_for_status() 
+        response = requests.get(picker_url, headers=headers, auth=auth, params=params, timeout=10)
+        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
         
-        results = response.json()
-        simplified_issues = [{'key': issue['key'], 'summary': issue['fields']['summary']} for issue in results.get('issues', [])]
+        picker_results = response.json()
+        
+        # --- Process and Format Results ---
+        # The picker API returns sections of issues. We need to parse them,
+        # combine them, and remove duplicates.
+        found_issues = {} # Use a dict to handle duplicates automatically based on key
+        
+        for section in picker_results.get('sections', []):
+            for issue in section.get('issues', []):
+                issue_key = issue.get('key')
+                if issue_key:
+                    # Use summaryText as it's the plain text version, fallback to summary
+                    summary = issue.get('summaryText', issue.get('summary', 'No summary available'))
+                    found_issues[issue_key] = {'key': issue_key, 'summary': summary}
+        
+        # Convert the dict of unique issues back to a list that the frontend expects
+        simplified_issues = list(found_issues.values())
         
         return jsonify(simplified_issues)
 
     except requests.exceptions.HTTPError as e:
         error_details = f"Jira returned HTTP {e.response.status_code}: {e.response.reason}"
         try:
+            # Try to get a more specific error message from Jira's response
             jira_error = e.response.json()
             if 'errorMessages' in jira_error and jira_error['errorMessages']:
                  error_details = f"Jira Error: {', '.join(jira_error['errorMessages'])}"
-            elif 'errors' in jira_error and jira_error['errors']:
-                 error_details = f"Jira Field Error: {json.dumps(jira_error['errors'])}"
-        except json.JSONDecodeError:
+        except ValueError: # Catches JSONDecodeError if body isn't valid JSON
             pass
         
         print(f"JIRA API Error: {error_details}")
@@ -105,5 +87,6 @@ def jira_search_endpoint():
         print(f"Unexpected Error: {str(e)}")
         return jsonify({"error": f"An unexpected server error occurred: {str(e)}"}), 500
 
+# This allows the app to be run by a production server like Gunicorn
 if __name__ == "__main__":
     app.run(port=int(os.environ.get("PORT", 8080)))
